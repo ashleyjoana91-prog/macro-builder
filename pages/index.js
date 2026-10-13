@@ -1,4 +1,4 @@
-import { useState, useRef } from 'react';
+import { createContext, useContext, useEffect, useRef, useState } from 'react';
 
 // ---------------------------------------------------------------
 // Options shown as tappable chips
@@ -16,6 +16,12 @@ const IDEAS = [
 const PROTEIN_CHIPS = [30, 40, 50, 60];
 const EXAMPLE_RECIPE =
   '500g chicken thigh, 1 tin chopped tomatoes, 200g basmati rice, 1 tbsp olive oil, 1 onion';
+
+const STORAGE_KEY = 'macro-builder:saved:v1';
+
+// Shared app helpers (saving, printing, little pop-up messages)
+const AppCtx = createContext(null);
+const useApp = () => useContext(AppCtx);
 
 // ---------------------------------------------------------------
 // Talking to our API
@@ -54,7 +60,17 @@ async function callApi(payload) {
 // ---------------------------------------------------------------
 const fmt = (n) => String(Math.round((Number(n) || 0) * 10) / 10);
 const fmtK = (n) => Math.round(Number(n) || 0).toLocaleString('en-GB');
+const r1 = (n) => Math.round(n * 10) / 10;
 const cleanNum = (v) => v.replace(/[^0-9.]/g, '');
+const newId = () => `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`;
+
+function fmtDate(iso) {
+  try {
+    return new Date(iso).toLocaleDateString('en-GB', { day: 'numeric', month: 'short' });
+  } catch {
+    return '';
+  }
+}
 
 function scrollToRef(ref) {
   setTimeout(() => {
@@ -62,47 +78,366 @@ function scrollToRef(ref) {
   }, 60);
 }
 
+function totalsOf(list) {
+  const t = list.reduce(
+    (a, i) => ({
+      kcal: a.kcal + i.kcal,
+      protein: a.protein + i.protein,
+      carbs: a.carbs + i.carbs,
+      fat: a.fat + i.fat,
+      fibre: a.fibre + i.fibre,
+    }),
+    { kcal: 0, protein: 0, carbs: 0, fat: 0, fibre: 0 }
+  );
+  return {
+    kcal: Math.round(t.kcal),
+    protein: r1(t.protein),
+    carbs: r1(t.carbs),
+    fat: r1(t.fat),
+    fibre: r1(t.fibre),
+  };
+}
+
+function perServingOf(t, n) {
+  return {
+    kcal: Math.round(t.kcal / n),
+    protein: r1(t.protein / n),
+    carbs: r1(t.carbs / n),
+    fat: r1(t.fat / n),
+    fibre: r1(t.fibre / n),
+  };
+}
+
+// Recalculate one ingredient for a new gram amount (calories from 4 / 4 / 9)
+function scaleIngredient(base, grams) {
+  const f = grams / base.grams;
+  const protein = r1(base.protein * f);
+  const carbs = r1(base.carbs * f);
+  const fat = r1(base.fat * f);
+  const fibre = r1(base.fibre * f);
+  return {
+    ...base,
+    grams: Math.round(grams),
+    protein,
+    carbs,
+    fat,
+    fibre,
+    kcal: Math.round(protein * 4 + carbs * 4 + fat * 9),
+  };
+}
+
+function titleOf(r) {
+  return r.mode === 'meal' ? r.name : r.title;
+}
+
+function timeText(r) {
+  return [r.prepMinutes ? `${r.prepMinutes} min prep` : '', r.cookMinutes ? `${r.cookMinutes} min cook` : '']
+    .filter(Boolean)
+    .join(' · ');
+}
+
+// ---------------------------------------------------------------
+// Saving on this device
+// ---------------------------------------------------------------
+function loadSaved() {
+  try {
+    const raw = window.localStorage.getItem(STORAGE_KEY);
+    const list = raw ? JSON.parse(raw) : [];
+    return Array.isArray(list) ? list : [];
+  } catch {
+    return [];
+  }
+}
+
+function storeSaved(list) {
+  try {
+    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(list));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// ---------------------------------------------------------------
+// Copying and sharing as text
+// ---------------------------------------------------------------
+async function copyText(text) {
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch {
+    // fall through to the older method
+  }
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', '');
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand('copy');
+    document.body.removeChild(ta);
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
+function macroLine(m) {
+  return `${fmtK(m.kcal)} kcal · ${fmt(m.protein)}g protein · ${fmt(m.carbs)}g carbs · ${fmt(m.fat)}g fat · ${fmt(m.fibre)}g fibre`;
+}
+
+function shoppingText(r) {
+  return [`Shopping list – ${r.name} (serves ${r.people})`, '', ...r.ingredients.map((i) => `• ${i.name} – ${i.shopQty}`)].join(
+    '\n'
+  );
+}
+
+function recipeText(r) {
+  const lines = [];
+  if (r.mode === 'meal') {
+    lines.push(r.name);
+    if (r.description) lines.push(r.description);
+    const t = timeText(r);
+    lines.push(`Serves ${r.people}${t ? ` · ${t}` : ''}`);
+    lines.push('', `Per serving: ${macroLine(r.perServing)}`);
+    lines.push('', `Shopping list (for ${r.people}):`, ...r.ingredients.map((i) => `• ${i.name} – ${i.shopQty}`));
+    if (r.method.length) lines.push('', 'Method:', ...r.method.map((s, i) => `${i + 1}. ${s}`));
+    if (r.swap) lines.push('', `Tip: ${r.swap}`);
+    lines.push('', `Whole meal: ${macroLine(r.totals)}`);
+  } else {
+    lines.push(`${r.title} – makes ${r.servings} ${r.servings === 1 ? 'serving' : 'servings'}`);
+    lines.push('', `Per serving: ${macroLine(r.perServing)}`);
+    lines.push(`Whole recipe: ${macroLine(r.totals)}`);
+    lines.push(
+      '',
+      'Ingredients:',
+      ...r.ingredients.map((i) => `• ${i.grams}g ${i.name} – ${fmtK(i.kcal)} kcal, ${fmt(i.protein)}g protein`)
+    );
+  }
+  if (r.assumptions && r.assumptions.length) lines.push('', 'Assumptions:', ...r.assumptions.map((a) => `• ${a}`));
+  lines.push('', 'Made with Macro Builder');
+  return lines.join('\n');
+}
+
 // ---------------------------------------------------------------
 // Page
 // ---------------------------------------------------------------
 export default function Home() {
   const [tab, setTab] = useState('macros');
+  const [saved, setSaved] = useState([]);
+  const [showSaved, setShowSaved] = useState(false);
+  const [viewing, setViewing] = useState(null);
+  const [printItem, setPrintItem] = useState(null);
+  const [toast, setToast] = useState('');
+  const toastTimer = useRef(null);
+
+  useEffect(() => {
+    setSaved(loadSaved());
+  }, []);
+
+  function notify(msg) {
+    setToast(msg);
+    clearTimeout(toastTimer.current);
+    toastTimer.current = setTimeout(() => setToast(''), 2200);
+  }
+
+  function saveItem(data) {
+    const item = { ...data, savedAt: new Date().toISOString() };
+    const exists = saved.some((x) => x.id === item.id);
+    const next = exists ? saved.map((x) => (x.id === item.id ? item : x)) : [item, ...saved];
+    setSaved(next);
+    const ok = storeSaved(next);
+    if (!ok) notify("Couldn't save on this device (private browsing?)");
+    else notify(exists ? 'Saved changes' : 'Saved to this device');
+  }
+
+  function removeItem(id) {
+    const next = saved.filter((x) => x.id !== id);
+    setSaved(next);
+    storeSaved(next);
+    if (viewing && viewing.id === id) setViewing(null);
+    if (!next.length) setShowSaved(false);
+    notify('Removed');
+  }
+
+  function printIt(data) {
+    setPrintItem(data);
+    setTimeout(() => window.print(), 150);
+  }
+
+  function openSaved(item) {
+    setViewing(item);
+    setShowSaved(false);
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  }
+
+  const isSaved = (id) => saved.some((x) => x.id === id);
 
   return (
-    <main className="app">
-      <header className="header">
-        <div className="brand-mark">M</div>
-        <div>
-          <h1 className="brand">Macro Builder</h1>
-          <p className="subtitle">UK nutrition, worked out for you</p>
+    <AppCtx.Provider value={{ saved, isSaved, saveItem, removeItem, printIt, notify }}>
+      <main className="app">
+        <header className="header">
+          <div className="brand-mark">M</div>
+          <div style={{ flex: 1 }}>
+            <h1 className="brand">Macro Builder</h1>
+            <p className="subtitle">UK nutrition, worked out for you</p>
+          </div>
+          {saved.length > 0 && (
+            <button
+              type="button"
+              className={`chip ${showSaved ? 'active' : ''}`}
+              onClick={() => setShowSaved((s) => !s)}
+            >
+              ★ Saved ({saved.length})
+            </button>
+          )}
+        </header>
+
+        {showSaved && saved.length > 0 && <SavedList onOpen={openSaved} onClose={() => setShowSaved(false)} />}
+
+        {viewing && (
+          <>
+            <div className="saved-banner">
+              <span>★ Saved recipe</span>
+              <button type="button" className="link-btn" onClick={() => setViewing(null)}>
+                ← Back to the app
+              </button>
+            </div>
+            {viewing.mode === 'macros' ? (
+              <MacrosResult key={viewing.id + viewing.savedAt} r={viewing} />
+            ) : (
+              <MealResult key={viewing.id + viewing.savedAt} r={viewing} />
+            )}
+          </>
+        )}
+
+        {/* Main app stays loaded underneath so nothing you've typed is lost */}
+        <div style={{ display: viewing ? 'none' : 'block' }}>
+          <div className="tabs" role="tablist">
+            <button
+              role="tab"
+              className={`tab ${tab === 'macros' ? 'active' : ''}`}
+              onClick={() => setTab('macros')}
+            >
+              Work out my macros
+            </button>
+            <button role="tab" className={`tab ${tab === 'meal' ? 'active' : ''}`} onClick={() => setTab('meal')}>
+              Build me a meal
+            </button>
+          </div>
+
+          <div style={{ display: tab === 'macros' ? 'block' : 'none' }}>
+            <MacrosMode />
+          </div>
+          <div style={{ display: tab === 'meal' ? 'block' : 'none' }}>
+            <MealMode />
+          </div>
         </div>
-      </header>
+      </main>
 
-      <div className="tabs" role="tablist">
-        <button
-          role="tab"
-          className={`tab ${tab === 'macros' ? 'active' : ''}`}
-          onClick={() => setTab('macros')}
-        >
-          Work out my macros
-        </button>
-        <button
-          role="tab"
-          className={`tab ${tab === 'meal' ? 'active' : ''}`}
-          onClick={() => setTab('meal')}
-        >
-          Build me a meal
-        </button>
-      </div>
+      <PrintView item={printItem} />
+      {toast && <div className="toast">{toast}</div>}
+    </AppCtx.Provider>
+  );
+}
 
-      {/* Both modes stay loaded so switching tabs doesn't lose your work */}
-      <div style={{ display: tab === 'macros' ? 'block' : 'none' }}>
-        <MacrosMode />
+// ---------------------------------------------------------------
+// Saved list
+// ---------------------------------------------------------------
+function SavedList({ onOpen, onClose }) {
+  const { saved, removeItem } = useApp();
+  return (
+    <section className="card saved-card">
+      <div className="section-head">
+        <h2 className="card-title">Saved on this device</h2>
+        <button type="button" className="link-btn" onClick={onClose}>
+          Close
+        </button>
       </div>
-      <div style={{ display: tab === 'meal' ? 'block' : 'none' }}>
-        <MealMode />
-      </div>
-    </main>
+      {saved.map((item) => (
+        <div className="saved-item" key={item.id}>
+          <button type="button" className="saved-open" onClick={() => onOpen(item)}>
+            <span className="saved-name">{titleOf(item)}</span>
+            <span className="saved-meta">
+              {item.mode === 'meal' ? 'Meal' : 'Macros'} · {fmtK(item.perServing.kcal)} kcal ·{' '}
+              {fmt(item.perServing.protein)}g protein per serving · {fmtDate(item.savedAt)}
+            </span>
+          </button>
+          <button
+            type="button"
+            className="icon-btn"
+            aria-label="Delete"
+            onClick={() => {
+              if (window.confirm('Delete this saved recipe?')) removeItem(item.id);
+            }}
+          >
+            ✕
+          </button>
+        </div>
+      ))}
+      <p className="hint">
+        These are saved in this browser only. Use Download PDF if you want a copy that lasts forever.
+      </p>
+    </section>
+  );
+}
+
+// ---------------------------------------------------------------
+// Save / PDF / Share / Copy buttons
+// ---------------------------------------------------------------
+function ResultActions({ data }) {
+  const { isSaved, saveItem, printIt, notify } = useApp();
+  const saved = isSaved(data.id);
+
+  async function share() {
+    const text = recipeText(data);
+    if (navigator.share) {
+      try {
+        await navigator.share({ title: titleOf(data), text });
+        return;
+      } catch (e) {
+        if (e && e.name === 'AbortError') return; // they closed the share sheet
+      }
+    }
+    const ok = await copyText(text);
+    notify(ok ? 'Copied – paste it anywhere' : "Couldn't copy on this device");
+  }
+
+  async function copyShopping() {
+    const ok = await copyText(shoppingText(data));
+    notify(ok ? 'Shopping list copied' : "Couldn't copy on this device");
+  }
+
+  async function copyAll() {
+    const ok = await copyText(recipeText(data));
+    notify(ok ? 'Copied' : "Couldn't copy on this device");
+  }
+
+  return (
+    <div className="action-grid">
+      <button type="button" className={`btn ${saved ? 'is-done' : ''}`} onClick={() => saveItem(data)}>
+        {saved ? '✓ Saved' : '☆ Save'}
+      </button>
+      <button type="button" className="btn" onClick={() => printIt(data)}>
+        ⬇ Download PDF
+      </button>
+      <button type="button" className="btn" onClick={share}>
+        ↗ Share
+      </button>
+      {data.mode === 'meal' ? (
+        <button type="button" className="btn" onClick={copyShopping}>
+          📋 Copy shopping list
+        </button>
+      ) : (
+        <button type="button" className="btn" onClick={copyAll}>
+          📋 Copy as text
+        </button>
+      )}
+    </div>
   );
 }
 
@@ -129,7 +464,7 @@ function MacrosMode() {
     scrollToRef(resultsRef);
     try {
       const data = await callApi({ mode: 'macros', recipe, servings });
-      setResult(data);
+      setResult({ ...data, id: newId() });
     } catch (e) {
       setError(e.message);
     } finally {
@@ -182,26 +517,82 @@ function MacrosMode() {
       <div ref={resultsRef} className="mt" style={{ scrollMarginTop: 70 }}>
         {loading && <Loading text="Weighing up your ingredients… this can take 15–30 seconds." />}
         {error && !loading && <ErrorCard message={error} onRetry={run} />}
-        {result && !loading && <MacrosResult r={result} />}
+        {result && !loading && <MacrosResult key={result.id} r={result} />}
       </div>
     </>
   );
 }
 
 function MacrosResult({ r }) {
+  // The original amounts from Claude - edits are recalculated from these
+  const base = r.baseIngredients || r.ingredients;
+  const [grams, setGrams] = useState(() => r.ingredients.map((i) => String(i.grams)));
+  const [servings, setServings] = useState(r.servings);
+
+  const ingredients = base.map((b, i) => {
+    const g = parseFloat(grams[i]);
+    if (!b.grams || !Number.isFinite(g) || g < 0) return b;
+    return scaleIngredient(b, g);
+  });
+  const editableRows = base.map((b) => b.grams > 0);
+  const edited = ingredients.map((ing, i) => ing.grams !== base[i].grams);
+  const anyEdited = edited.some(Boolean);
+  const totals = totalsOf(ingredients);
+  const perServing = perServingOf(totals, servings);
+
+  // This is what gets saved, shared and printed - including your edits
+  const current = { ...r, baseIngredients: base, ingredients, totals, perServing, servings };
+
+  function changeGrams(i, value) {
+    const clean = cleanNum(value);
+    setGrams((list) => list.map((x, j) => (j === i ? clean : x)));
+  }
+
+  function resetGrams() {
+    setGrams(base.map((b) => String(b.grams)));
+  }
+
   return (
     <>
       <MacroHero
-        per={r.perServing}
-        label={`Per serving · makes ${r.servings} ${r.servings === 1 ? 'serving' : 'servings'}`}
+        per={perServing}
+        label={`Per serving · makes ${servings} ${servings === 1 ? 'serving' : 'servings'}`}
       />
+
+      <ResultActions data={current} />
 
       <section className="card">
         <h2 className="card-title">{r.title}</h2>
-        <IngredientTable ingredients={r.ingredients} totals={r.totals} />
+
+        <div className="row" style={{ marginBottom: 14 }}>
+          <span className="muted" style={{ fontSize: 14 }}>
+            Servings
+          </span>
+          <Stepper value={servings} onChange={setServings} min={1} max={20} />
+        </div>
+
+        {anyEdited && (
+          <div className="edited-note">
+            <span>Quantities changed – totals updated.</span>
+            <button type="button" className="link-btn" onClick={resetGrams}>
+              Reset
+            </button>
+          </div>
+        )}
+
+        <IngredientTable
+          ingredients={ingredients}
+          totals={totals}
+          editable
+          grams={grams}
+          editableRows={editableRows}
+          edited={edited}
+          onGramsChange={changeGrams}
+        />
+        <p className="hint">Tap a gram amount to change it. The macros recalculate instantly.</p>
         <p className="hint">
-          Whole recipe: <strong>{fmtK(r.totals.kcal)} kcal</strong> · {fmt(r.totals.protein)}g protein ·{' '}
-          {fmt(r.totals.carbs)}g carbs · {fmt(r.totals.fat)}g fat · {fmt(r.totals.fibre)}g fibre
+          Whole recipe: <strong>{fmtK(totals.kcal)} kcal</strong> · {fmt(totals.protein)}g protein ·{' '}
+          {fmt(totals.carbs)}g carbs · {fmt(totals.fat)}g fat · {fmt(totals.fibre)}g fibre
         </p>
       </section>
 
@@ -286,7 +677,7 @@ function MealMode() {
         fancy,
         avoid: isRegen ? history : [],
       });
-      setResult({ ...data, targets, mealType });
+      setResult({ ...data, targets, mealType, id: newId() });
       setHistory(isRegen ? [...history, data.name] : [data.name]);
     } catch (e) {
       setError(e.message);
@@ -463,11 +854,7 @@ function MealMode() {
         {loading && <Loading text="Planning your meal… this can take 20–40 seconds." />}
         {error && !loading && <ErrorCard message={error} onRetry={() => run(lastWasRegen)} />}
         {result && !loading && (
-          <MealResult
-            r={result}
-            onRegenerate={() => run(true)}
-            onEdit={() => scrollToRef(topRef)}
-          />
+          <MealResult r={result} onRegenerate={() => run(true)} onEdit={() => scrollToRef(topRef)} />
         )}
       </div>
     </>
@@ -475,12 +862,7 @@ function MealMode() {
 }
 
 function MealResult({ r, onRegenerate, onEdit }) {
-  const time = [
-    r.prepMinutes ? `${r.prepMinutes} min prep` : '',
-    r.cookMinutes ? `${r.cookMinutes} min cook` : '',
-  ]
-    .filter(Boolean)
-    .join(' · ');
+  const time = timeText(r);
 
   return (
     <>
@@ -494,6 +876,8 @@ function MealResult({ r, onRegenerate, onEdit }) {
       </section>
 
       <MacroHero per={r.perServing} label="Per serving" />
+
+      <ResultActions data={r} />
 
       <TargetsCard targets={r.targets} actual={r.perServing} swap={r.swap} />
 
@@ -538,14 +922,16 @@ function MealResult({ r, onRegenerate, onEdit }) {
 
       <Assumptions items={r.assumptions} />
 
-      <div className="btn-row">
-        <button className="btn btn-secondary" onClick={onRegenerate}>
-          ↻ Give me a different option
-        </button>
-        <button className="btn btn-ghost" onClick={onEdit}>
-          Change my choices
-        </button>
-      </div>
+      {onRegenerate && (
+        <div className="btn-row">
+          <button className="btn btn-secondary" onClick={onRegenerate}>
+            ↻ Give me a different option
+          </button>
+          <button className="btn btn-ghost" onClick={onEdit}>
+            Change my choices
+          </button>
+        </div>
+      )}
     </>
   );
 }
@@ -611,11 +997,21 @@ function Stepper({ value, onChange, min = 1, max = 20, suffix }) {
   return (
     <div className="row">
       <div className="stepper">
-        <button type="button" aria-label="Fewer" onClick={() => onChange(Math.max(min, value - 1))} disabled={value <= min}>
+        <button
+          type="button"
+          aria-label="Fewer"
+          onClick={() => onChange(Math.max(min, value - 1))}
+          disabled={value <= min}
+        >
           −
         </button>
         <span className="stepper-value">{value}</span>
-        <button type="button" aria-label="More" onClick={() => onChange(Math.min(max, value + 1))} disabled={value >= max}>
+        <button
+          type="button"
+          aria-label="More"
+          onClick={() => onChange(Math.min(max, value + 1))}
+          disabled={value >= max}
+        >
           +
         </button>
       </div>
@@ -651,7 +1047,7 @@ function MacroTile({ cls, value, label }) {
   );
 }
 
-function IngredientTable({ ingredients, totals }) {
+function IngredientTable({ ingredients, totals, editable, grams, editableRows, edited, onGramsChange }) {
   return (
     <div className="table-wrap">
       <table className="table">
@@ -668,9 +1064,21 @@ function IngredientTable({ ingredients, totals }) {
         </thead>
         <tbody>
           {ingredients.map((ing, i) => (
-            <tr key={i}>
+            <tr key={i} className={edited && edited[i] ? 'is-edited' : ''}>
               <td>{ing.name}</td>
-              <td>{ing.grams}g</td>
+              <td>
+                {editable && editableRows && editableRows[i] ? (
+                  <input
+                    className="qty-input"
+                    inputMode="decimal"
+                    value={grams[i]}
+                    onChange={(e) => onGramsChange(i, e.target.value)}
+                    aria-label={`Grams of ${ing.name}`}
+                  />
+                ) : (
+                  `${ing.grams}g`
+                )}
+              </td>
               <td>{fmtK(ing.kcal)}</td>
               <td className="p">{fmt(ing.protein)}</td>
               <td>{fmt(ing.carbs)}</td>
@@ -725,5 +1133,128 @@ function ErrorCard({ message, onRetry }) {
         Try again
       </button>
     </div>
+  );
+}
+
+// ---------------------------------------------------------------
+// Printer-friendly version (used for Download PDF)
+// ---------------------------------------------------------------
+function PrintView({ item }) {
+  if (!item) return <div className="print-area" />;
+  const isMeal = item.mode === 'meal';
+  const per = item.perServing;
+  const time = timeText(item);
+
+  return (
+    <div className="print-area">
+      <h1>{titleOf(item)}</h1>
+      <p className="print-meta">
+        {isMeal
+          ? `${item.mealType} · serves ${item.people}${time ? ` · ${time}` : ''}`
+          : `Makes ${item.servings} ${item.servings === 1 ? 'serving' : 'servings'}`}
+      </p>
+      {isMeal && item.description && <p className="print-desc">{item.description}</p>}
+
+      <div className="print-macros">
+        <div>
+          <span>Per serving:</span> {fmtK(per.kcal)} kcal
+        </div>
+        <div>{fmt(per.protein)}g protein</div>
+        <div>{fmt(per.carbs)}g carbs</div>
+        <div>{fmt(per.fat)}g fat</div>
+        <div>{fmt(per.fibre)}g fibre</div>
+      </div>
+
+      {isMeal && (
+        <>
+          <h2>Shopping list (for {item.people})</h2>
+          <ul className="print-shop">
+            {item.ingredients.map((ing, i) => (
+              <li key={i}>
+                <span>{ing.name}</span>
+                <strong>{ing.shopQty}</strong>
+              </li>
+            ))}
+          </ul>
+
+          {item.method.length > 0 && (
+            <>
+              <h2>Method</h2>
+              <ol>
+                {item.method.map((s, i) => (
+                  <li key={i}>{s}</li>
+                ))}
+              </ol>
+            </>
+          )}
+
+          {item.swap && (
+            <>
+              <h2>Fine-tune it</h2>
+              <p>{item.swap}</p>
+            </>
+          )}
+        </>
+      )}
+
+      <h2>{isMeal ? 'Ingredient breakdown (whole meal)' : 'Ingredients (whole recipe)'}</h2>
+      <PrintTable ingredients={item.ingredients} totals={item.totals} />
+
+      {item.assumptions && item.assumptions.length > 0 && (
+        <>
+          <h2>Assumptions</h2>
+          <ul>
+            {item.assumptions.map((a, i) => (
+              <li key={i}>{a}</li>
+            ))}
+          </ul>
+        </>
+      )}
+
+      <p className="print-footer">
+        Made with Macro Builder · {fmtDate(new Date().toISOString())}. Nutrition values are estimates based on UK
+        data and raw weights.
+      </p>
+    </div>
+  );
+}
+
+function PrintTable({ ingredients, totals }) {
+  return (
+    <table>
+      <thead>
+        <tr>
+          <th>Ingredient</th>
+          <th>Grams</th>
+          <th>kcal</th>
+          <th>Protein</th>
+          <th>Carbs</th>
+          <th>Fat</th>
+          <th>Fibre</th>
+        </tr>
+      </thead>
+      <tbody>
+        {ingredients.map((ing, i) => (
+          <tr key={i}>
+            <td>{ing.name}</td>
+            <td>{ing.grams}g</td>
+            <td>{fmtK(ing.kcal)}</td>
+            <td>{fmt(ing.protein)}</td>
+            <td>{fmt(ing.carbs)}</td>
+            <td>{fmt(ing.fat)}</td>
+            <td>{fmt(ing.fibre)}</td>
+          </tr>
+        ))}
+        <tr className="total-row">
+          <td>Total</td>
+          <td></td>
+          <td>{fmtK(totals.kcal)}</td>
+          <td>{fmt(totals.protein)}</td>
+          <td>{fmt(totals.carbs)}</td>
+          <td>{fmt(totals.fat)}</td>
+          <td>{fmt(totals.fibre)}</td>
+        </tr>
+      </tbody>
+    </table>
   );
 }
