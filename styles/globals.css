@@ -78,6 +78,8 @@ button { cursor: pointer; -webkit-tap-highlight-color: transparent; }
   box-shadow: var(--shadow); padding: 18px; margin-bottom: 14px;
 }
 .card-title { font-size: 16px; font-weight: 700; margin: 0 0 12px; }
+.section-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-bottom: 12px; }
+.section-head .card-title { margin: 0; }
 .step-num {
   display: inline-grid; place-items: center;
   width: 22px; height: 22px; border-radius: 50%;
@@ -151,6 +153,19 @@ button { cursor: pointer; -webkit-tap-highlight-color: transparent; }
 .btn-row { display: flex; gap: 10px; flex-wrap: wrap; }
 .btn-row .btn { flex: 1 1 140px; }
 .btn-small { padding: 9px 12px; font-size: 13px; border-radius: 11px; }
+.btn.is-done { background: var(--accent); color: #fff; }
+
+/* Save / PDF / Share / Copy buttons */
+.action-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 14px; }
+.action-grid .btn { padding: 12px 10px; font-size: 14px; background: var(--card); color: var(--ink); border: 1.5px solid var(--line); }
+.action-grid .btn.is-done { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+.icon-btn {
+  border: 0; background: transparent; color: var(--muted);
+  width: 36px; height: 36px; border-radius: 10px; font-size: 18px;
+}
+.icon-btn:hover { background: var(--soft); color: var(--danger); }
+.link-btn { border: 0; background: none; padding: 0; color: var(--accent); font-weight: 600; font-size: 13px; }
 
 /* ---------- Loading ---------- */
 .loading { text-align: center; padding: 34px 18px; color: var(--muted); font-size: 14px; }
@@ -194,12 +209,19 @@ button { cursor: pointer; -webkit-tap-highlight-color: transparent; }
   position: sticky; left: 0; background: var(--card);
 }
 .table tr.total-row td { font-weight: 700; border-bottom: 0; border-top: 1.5px solid var(--ink); }
+.table tr.is-edited td { background: #FFFBEF; }
+.table tr.is-edited td:first-child { background: #FFFBEF; }
 .table .p { color: var(--protein); font-weight: 600; }
 .qty-input {
   width: 70px; padding: 6px 8px; border: 1.5px solid var(--line); border-radius: 8px;
   text-align: right; font-size: 16px; background: #FCFBF8;
 }
 .qty-input:focus { border-color: var(--accent); outline: none; }
+.edited-note {
+  display: flex; justify-content: space-between; align-items: center; gap: 10px;
+  background: #FFF6E0; color: #8A5A00; border-radius: 10px;
+  padding: 10px 12px; font-size: 13px; margin-bottom: 12px;
+}
 
 /* ---------- Lists, notes, recipe ---------- */
 .notes { margin: 0; padding-left: 18px; font-size: 14px; color: var(--muted); line-height: 1.55; }
@@ -246,19 +268,27 @@ button { cursor: pointer; -webkit-tap-highlight-color: transparent; }
 .swap strong { color: var(--accent); }
 
 /* ---------- Saved recipes & toast ---------- */
+.saved-card { border: 1.5px solid var(--accent-soft); }
 .saved-item {
   display: flex; justify-content: space-between; align-items: center; gap: 10px;
   padding: 12px 0; border-bottom: 1px solid var(--line);
 }
 .saved-item:last-child { border-bottom: 0; }
-.saved-name { font-weight: 600; font-size: 15px; background: none; border: 0; padding: 0; text-align: left; }
-.saved-meta { font-size: 12px; color: var(--muted); }
+.saved-open { flex: 1; background: none; border: 0; padding: 0; text-align: left; }
+.saved-name { display: block; font-weight: 600; font-size: 15px; }
+.saved-meta { display: block; font-size: 12px; color: var(--muted); margin-top: 2px; }
+.saved-banner {
+  display: flex; justify-content: space-between; align-items: center; gap: 10px;
+  background: var(--accent-soft); color: var(--accent); border-radius: 12px;
+  padding: 10px 14px; font-size: 13px; font-weight: 600; margin-bottom: 14px;
+}
 
 .toast {
   position: fixed; left: 50%; bottom: calc(24px + env(safe-area-inset-bottom));
   transform: translateX(-50%);
   background: var(--ink); color: #fff; padding: 11px 18px; border-radius: 999px;
   font-size: 14px; font-weight: 600; z-index: 50; box-shadow: var(--shadow);
+  white-space: nowrap;
 }
 
 .muted { color: var(--muted); }
@@ -268,4 +298,37 @@ button { cursor: pointer; -webkit-tap-highlight-color: transparent; }
   .hero-kcal { font-size: 44px; }
   .macro-tile .val { font-size: 17px; }
   .field-grid { grid-template-columns: 1fr 1fr 1fr; gap: 8px; }
+}
+
+/* ---------- Print / Save as PDF ---------- */
+.print-area { display: none; }
+
+@media print {
+  @page { margin: 14mm; }
+  html, body { background: #fff !important; }
+  .app, .toast { display: none !important; }
+
+  .print-area { display: block; color: #000; font-size: 11pt; line-height: 1.45; }
+  .print-area h1 { font-size: 20pt; margin: 0 0 4pt; letter-spacing: -0.01em; }
+  .print-area h2 {
+    font-size: 12pt; margin: 16pt 0 6pt; padding-bottom: 3pt;
+    border-bottom: 1px solid #ccc; break-after: avoid;
+  }
+  .print-area .print-meta { color: #555; margin: 0 0 10pt; }
+  .print-area .print-desc { margin: 0 0 10pt; }
+  .print-area .print-macros {
+    display: flex; gap: 16pt; flex-wrap: wrap; font-weight: 700;
+    padding: 8pt 10pt; border: 1px solid #ccc; border-radius: 6pt;
+  }
+  .print-area .print-macros span { font-weight: 400; color: #555; }
+  .print-area table { width: 100%; border-collapse: collapse; font-size: 9.5pt; }
+  .print-area th, .print-area td { border-bottom: 1px solid #ddd; padding: 4pt; text-align: right; }
+  .print-area th { font-size: 8.5pt; text-transform: uppercase; color: #555; }
+  .print-area th:first-child, .print-area td:first-child { text-align: left; }
+  .print-area tr.total-row td { font-weight: 700; border-top: 1.5px solid #000; border-bottom: 0; }
+  .print-area ul, .print-area ol { padding-left: 18pt; margin: 0; }
+  .print-area li { margin-bottom: 3pt; }
+  .print-area .print-shop li { display: flex; justify-content: space-between; gap: 12pt; }
+  .print-area .print-footer { margin-top: 18pt; font-size: 8.5pt; color: #777; }
+  .print-area li, .print-area tr { break-inside: avoid; }
 }
