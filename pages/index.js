@@ -224,6 +224,277 @@ function recipeText(r) {
 }
 
 // ---------------------------------------------------------------
+// My week + calendar helpers
+// ---------------------------------------------------------------
+const PLAN_KEY = 'macro-builder:plan:v1';
+const LOG_KEY = 'macro-builder:log:v1';
+const TIMES_KEY = 'macro-builder:times:v1';
+const TEMPLATE_URL = '/meal-plan-template.xlsx';
+const WEEK = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
+const PORTIONS = [0.5, 1, 1.5, 2];
+const DEFAULT_TIMES = {
+  'pre-gym shake': '06:30',
+  breakfast: '08:30',
+  'post-gym shake': '10:00',
+  lunch: '12:30',
+  afternoon: '15:30',
+  'afternoon shake': '15:30',
+  snack: '15:30',
+  dinner: '18:30',
+};
+
+function readStore(key, fallback) {
+  try {
+    const raw = window.localStorage.getItem(key);
+    return raw ? JSON.parse(raw) : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function writeStore(key, value) {
+  try {
+    window.localStorage.setItem(key, JSON.stringify(value));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const pad = (n) => String(n).padStart(2, '0');
+const isoDate = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+const todayIso = () => isoDate(new Date());
+const portionText = (p) => (p === 0.5 ? '½' : p === 1.5 ? '1½' : String(p));
+
+// The date of that weekday in the current week (weeks start on Monday)
+function dateForWeekday(dayName) {
+  const idx = WEEK.indexOf(dayName);
+  const now = new Date();
+  const dow = (now.getDay() + 6) % 7;
+  return isoDate(new Date(now.getFullYear(), now.getMonth(), now.getDate() + (idx - dow)));
+}
+
+function niceDate(iso) {
+  try {
+    const [y, m, d] = iso.split('-').map(Number);
+    return new Date(y, m - 1, d).toLocaleDateString('en-GB', { weekday: 'short', day: 'numeric', month: 'short' });
+  } catch {
+    return iso;
+  }
+}
+
+function guessMeal() {
+  const h = new Date().getHours();
+  return h < 11 ? 'Breakfast' : h < 15 ? 'Lunch' : h < 17 ? 'Snack' : 'Dinner';
+}
+
+function defaultTime(meal, saved) {
+  const k = String(meal || '').trim().toLowerCase();
+  return (saved && saved[k]) || DEFAULT_TIMES[k] || '12:00';
+}
+
+function toUtcStamp(date, time, addMinutes = 0) {
+  const d = new Date(`${date}T${time || '12:00'}:00`);
+  d.setMinutes(d.getMinutes() + addMinutes);
+  return d.toISOString().replace(/[-:]/g, '').replace(/\.\d{3}/, '');
+}
+
+function scaled(e, portion) {
+  return {
+    kcal: Math.round((e.kcal || 0) * portion),
+    protein: r1((e.protein || 0) * portion),
+    carbs: r1((e.carbs || 0) * portion),
+    fat: r1((e.fat || 0) * portion),
+    fibre: r1((e.fibre || 0) * portion),
+  };
+}
+
+function sumLog(entries) {
+  return (entries || []).reduce(
+    (a, e) => ({
+      kcal: a.kcal + (e.kcal || 0),
+      protein: r1(a.protein + (e.protein || 0)),
+      carbs: r1(a.carbs + (e.carbs || 0)),
+      fat: r1(a.fat + (e.fat || 0)),
+    }),
+    { kcal: 0, protein: 0, carbs: 0, fat: 0 }
+  );
+}
+
+const eventTitle = (meal, m) => `${meal} · ${fmtK(m.kcal)} kcal · P${fmt(m.protein)} C${fmt(m.carbs)} F${fmt(m.fat)}`;
+
+function eventDetails(what, portion, m) {
+  const lines = [];
+  if (what) lines.push(what);
+  lines.push(`Portion: ${portionText(portion)}`);
+  lines.push(
+    `${fmtK(m.kcal)} kcal · ${fmt(m.protein)}g protein · ${fmt(m.carbs)}g carbs · ${fmt(m.fat)}g fat${
+      m.fibre ? ` · ${fmt(m.fibre)}g fibre` : ''
+    }`
+  );
+  lines.push('Logged from Macro Builder');
+  return lines.join('\n');
+}
+
+const icsUrl = (events) => `/api/ics?e=${encodeURIComponent(JSON.stringify(events))}`;
+
+function googleUrl(ev) {
+  const p = new URLSearchParams({ action: 'TEMPLATE', text: ev.t, dates: `${ev.s}/${ev.e}`, details: ev.d });
+  return `https://calendar.google.com/calendar/render?${p.toString()}`;
+}
+
+// The spreadsheet reader is loaded only when someone uploads a plan
+let xlsxPromise = null;
+function loadXlsx() {
+  if (typeof window !== 'undefined' && window.XLSX) return Promise.resolve(window.XLSX);
+  if (xlsxPromise) return xlsxPromise;
+  const urls = [
+    'https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js',
+    'https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js',
+  ];
+  xlsxPromise = new Promise((resolve, reject) => {
+    const tryNext = (i) => {
+      if (i >= urls.length) {
+        xlsxPromise = null;
+        reject(new Error("Couldn't load the spreadsheet reader. Check your internet and try again."));
+        return;
+      }
+      const s = document.createElement('script');
+      s.src = urls[i];
+      s.async = true;
+      s.onload = () => (window.XLSX ? resolve(window.XLSX) : tryNext(i + 1));
+      s.onerror = () => {
+        s.remove();
+        tryNext(i + 1);
+      };
+      document.head.appendChild(s);
+    };
+    tryNext(0);
+  });
+  return xlsxPromise;
+}
+
+function readNum(v) {
+  if (v === null || v === undefined || String(v).trim() === '') return null;
+  if (typeof v === 'number') return v;
+  const n = parseFloat(String(v).replace(/[^0-9.\-]/g, ''));
+  return Number.isFinite(n) ? n : NaN;
+}
+
+// Reads a meal plan laid out like the template
+function parsePlan(XLSX, buffer, fileName) {
+  let wb;
+  try {
+    wb = XLSX.read(buffer, { type: 'array' });
+  } catch {
+    throw new Error("That file couldn't be opened. Upload the meal plan as an Excel (.xlsx) file.");
+  }
+  const sheetName = wb.SheetNames.find((n) => n.trim().toLowerCase() === 'meal plan') || wb.SheetNames[0];
+  const rows = XLSX.utils.sheet_to_json(wb.Sheets[sheetName], { header: 1, defval: '', raw: true });
+  const norm = (v) => String(v ?? '').trim().toLowerCase();
+
+  const hIdx = rows.findIndex((r) => r.some((c) => norm(c) === 'day') && r.some((c) => norm(c).startsWith('kcal')));
+  if (hIdx < 0) {
+    throw new Error("Couldn't find the headings row. It needs Day, Meal, kcal, Protein, Carbs and Fat, like the template.");
+  }
+  const head = rows[hIdx].map(norm);
+  const find = (test) => head.findIndex(test);
+  const col = {
+    day: find((h) => h === 'day'),
+    type: find((h) => h.startsWith('day type')),
+    meal: find((h) => h === 'meal'),
+    what: find((h) => h.startsWith('what')),
+    kcal: find((h) => h.startsWith('kcal') || h.startsWith('calories')),
+    protein: find((h) => h.startsWith('protein')),
+    carbs: find((h) => h.startsWith('carb')),
+    fat: find((h) => h.startsWith('fat')),
+  };
+  const missing = ['day', 'meal', 'kcal', 'protein', 'carbs', 'fat'].filter((k) => col[k] < 0);
+  if (missing.length) throw new Error(`Missing column: ${missing.join(', ')}. Keep the template's headings.`);
+
+  const MACROS = [
+    ['kcal', 'kcal'],
+    ['protein', 'protein'],
+    ['carbs', 'carbs'],
+    ['fat', 'fat'],
+  ];
+  const cell = (r, k) => (col[k] >= 0 ? r[col[k]] : '');
+
+  // Daily target row
+  let target = null;
+  const tRow = rows.find((r) => r.some((c) => norm(c) === 'daily target'));
+  if (tRow) {
+    const t = {};
+    MACROS.forEach(([k]) => (t[k] = readNum(cell(tRow, k))));
+    if (MACROS.every(([k]) => Number.isFinite(t[k]))) target = t;
+  }
+
+  const problems = [];
+  const days = {};
+  for (let i = hIdx + 1; i < rows.length; i++) {
+    const r = rows[i];
+    const rawDay = norm(cell(r, 'day'));
+    const day = WEEK.find((d) => rawDay && d.toLowerCase().startsWith(rawDay.slice(0, 3)));
+    if (!day) continue;
+    const meal = String(cell(r, 'meal') || '').trim();
+    const what = String(cell(r, 'what') || '').trim();
+    if (!meal && !what) continue;
+
+    const choice = /your choice/i.test(what);
+    const vals = {};
+    MACROS.forEach(([k, label]) => {
+      const n = readNum(cell(r, k));
+      if (Number.isNaN(n)) problems.push(`Row ${i + 1}: ${label} should be a number`);
+      vals[k] = Number.isFinite(n) ? n : null;
+    });
+    const hasAll = MACROS.every(([k]) => vals[k] !== null);
+    if (!choice && !hasAll) {
+      problems.push(`Row ${i + 1} (${day} ${meal || 'meal'}): fill in kcal, protein, carbs and fat`);
+      continue;
+    }
+
+    if (!days[day]) days[day] = { name: day, type: '', meals: [] };
+    const type = String(cell(r, 'type') || '').trim();
+    if (type && !days[day].type) days[day].type = type;
+    days[day].meals.push({
+      meal: meal || 'Meal',
+      what,
+      choice,
+      hasAll,
+      kcal: Math.round(vals.kcal || 0),
+      protein: r1(vals.protein || 0),
+      carbs: r1(vals.carbs || 0),
+      fat: r1(vals.fat || 0),
+      fibre: 0,
+    });
+  }
+
+  if (problems.length) {
+    const more = problems.length > 5 ? ` (and ${problems.length - 5} more)` : '';
+    throw new Error(`Please fix these in your spreadsheet: ${problems.slice(0, 5).join('; ')}${more}.`);
+  }
+
+  const list = WEEK.filter((d) => days[d]).map((d) => days[d]);
+  if (!list.length) throw new Error('No meals found. Fill in at least one day, then upload it again.');
+
+  // "Your choice" rows with no numbers = whatever is left of the daily target
+  list.forEach((d) => {
+    const planned = sumLog(d.meals.filter((m) => !m.choice));
+    d.meals.forEach((m) => {
+      if (m.choice && !m.hasAll && target) {
+        m.kcal = Math.max(0, Math.round(target.kcal - planned.kcal));
+        m.protein = Math.max(0, r1(target.protein - planned.protein));
+        m.carbs = Math.max(0, r1(target.carbs - planned.carbs));
+        m.fat = Math.max(0, r1(target.fat - planned.fat));
+      }
+      delete m.hasAll;
+    });
+  });
+
+  return { fileName, target, days: list, savedAt: new Date().toISOString() };
+}
+
+// ---------------------------------------------------------------
 // Page
 // ---------------------------------------------------------------
 export default function Home() {
@@ -235,9 +506,71 @@ export default function Home() {
   const [toast, setToast] = useState('');
   const toastTimer = useRef(null);
 
+  // My week + calendar
+  const [plan, setPlanState] = useState(null);
+  const [log, setLogState] = useState({});
+  const [times, setTimes] = useState({});
+  const [calendarCfg, setCalendarCfg] = useState(null);
+  const [mealPrefill, setMealPrefill] = useState(null);
+
   useEffect(() => {
     setSaved(loadSaved());
+    setPlanState(readStore(PLAN_KEY, null));
+    setLogState(readStore(LOG_KEY, {}));
+    setTimes(readStore(TIMES_KEY, {}));
   }, []);
+
+  function setPlan(p) {
+    setPlanState(p);
+    if (p) {
+      if (!writeStore(PLAN_KEY, p)) notify("Couldn't save the plan on this device (private browsing?)");
+    } else {
+      try {
+        window.localStorage.removeItem(PLAN_KEY);
+      } catch {
+        // nothing to do
+      }
+    }
+  }
+
+  function addLogs(date, entries) {
+    setLogState((prev) => {
+      const next = { ...prev, [date]: [...(prev[date] || []), ...entries] };
+      // Keep the last 60 days only, so the phone doesn't fill up
+      const cutoff = isoDate(new Date(Date.now() - 60 * 864e5));
+      Object.keys(next).forEach((d) => {
+        if (d < cutoff) delete next[d];
+      });
+      writeStore(LOG_KEY, next);
+      return next;
+    });
+  }
+
+  function removeLog(date, id) {
+    setLogState((prev) => {
+      const next = { ...prev, [date]: (prev[date] || []).filter((e) => e.id !== id) };
+      writeStore(LOG_KEY, next);
+      return next;
+    });
+  }
+
+  function rememberTimes(pairs) {
+    setTimes((prev) => {
+      const next = { ...prev };
+      pairs.forEach(([meal, time]) => {
+        if (meal && time) next[String(meal).trim().toLowerCase()] = time;
+      });
+      writeStore(TIMES_KEY, next);
+      return next;
+    });
+  }
+
+  function buildDinner(pf) {
+    setMealPrefill({ ...pf, nonce: Date.now() });
+    setViewing(null);
+    setTab('meal');
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  }
 
   function notify(msg) {
     setToast(msg);
@@ -278,7 +611,20 @@ export default function Home() {
   const isSaved = (id) => saved.some((x) => x.id === id);
 
   return (
-    <AppCtx.Provider value={{ saved, isSaved, saveItem, removeItem, printIt, notify }}>
+    <AppCtx.Provider
+      value={{
+        saved,
+        isSaved,
+        saveItem,
+        removeItem,
+        printIt,
+        notify,
+        times,
+        addLogs,
+        rememberTimes,
+        openCalendar: setCalendarCfg,
+      }}
+    >
       <main className="app">
         <header className="header">
           <div className="brand-mark">M</div>
@@ -317,16 +663,19 @@ export default function Home() {
 
         {/* Main app stays loaded underneath so nothing you've typed is lost */}
         <div style={{ display: viewing ? 'none' : 'block' }}>
-          <div className="tabs" role="tablist">
+          <div className="tabs" role="tablist" style={{ gridTemplateColumns: 'repeat(3, 1fr)' }}>
             <button
               role="tab"
               className={`tab ${tab === 'macros' ? 'active' : ''}`}
               onClick={() => setTab('macros')}
             >
-              Work out my macros
+              My macros
             </button>
             <button role="tab" className={`tab ${tab === 'meal' ? 'active' : ''}`} onClick={() => setTab('meal')}>
-              Build me a meal
+              Build a meal
+            </button>
+            <button role="tab" className={`tab ${tab === 'week' ? 'active' : ''}`} onClick={() => setTab('week')}>
+              My week
             </button>
           </div>
 
@@ -334,11 +683,15 @@ export default function Home() {
             <MacrosMode />
           </div>
           <div style={{ display: tab === 'meal' ? 'block' : 'none' }}>
-            <MealMode />
+            <MealMode prefill={mealPrefill} />
+          </div>
+          <div style={{ display: tab === 'week' ? 'block' : 'none' }}>
+            <WeekMode plan={plan} setPlan={setPlan} log={log} removeLog={removeLog} onBuildDinner={buildDinner} />
           </div>
         </div>
       </main>
 
+      {calendarCfg && <CalendarSheet key={calendarCfg.key || 'sheet'} cfg={calendarCfg} onClose={() => setCalendarCfg(null)} />}
       <PrintView item={printItem} />
       {toast && <div className="toast">{toast}</div>}
     </AppCtx.Provider>
@@ -390,8 +743,28 @@ function SavedList({ onOpen, onClose }) {
 // Save / PDF / Share / Copy buttons
 // ---------------------------------------------------------------
 function ResultActions({ data }) {
-  const { isSaved, saveItem, printIt, notify } = useApp();
+  const { isSaved, saveItem, printIt, notify, openCalendar } = useApp();
   const saved = isSaved(data.id);
+
+  function addToCalendar() {
+    const p = data.perServing;
+    openCalendar({
+      key: newId(),
+      pickMeal: true,
+      date: data.logDate || todayIso(),
+      items: [
+        {
+          meal: data.logMeal || (data.mode === 'meal' && data.mealType ? data.mealType : guessMeal()),
+          what: titleOf(data),
+          kcal: p.kcal,
+          protein: p.protein,
+          carbs: p.carbs,
+          fat: p.fat,
+          fibre: p.fibre,
+        },
+      ],
+    });
+  }
 
   async function share() {
     const text = recipeText(data);
@@ -418,6 +791,10 @@ function ResultActions({ data }) {
   }
 
   return (
+    <>
+    <button type="button" className="btn btn-primary btn-block" style={{ marginBottom: 10 }} onClick={addToCalendar}>
+      📅 Add a portion to my calendar
+    </button>
     <div className="action-grid">
       <button type="button" className={`btn ${saved ? 'is-done' : ''}`} onClick={() => saveItem(data)}>
         {saved ? '✓ Saved' : '☆ Save'}
@@ -438,6 +815,7 @@ function ResultActions({ data }) {
         </button>
       )}
     </div>
+    </>
   );
 }
 
@@ -604,7 +982,8 @@ function MacrosResult({ r }) {
 // ---------------------------------------------------------------
 // MODE 2: Build me a meal
 // ---------------------------------------------------------------
-function MealMode() {
+function MealMode({ prefill }) {
+  const [dinnerFor, setDinnerFor] = useState(null);
   const [mealType, setMealType] = useState('Dinner');
   const [people, setPeople] = useState(2);
   const [targetMode, setTargetMode] = useState('perPerson');
@@ -627,6 +1006,22 @@ function MealMode() {
 
   const isTotal = targetMode === 'total';
   const unitLabel = isTotal ? `total for ${people}` : 'per person';
+
+  // "Build my dinner" from My week fills in what's left for that day
+  useEffect(() => {
+    if (!prefill) return;
+    setMealType('Dinner');
+    setPeople(1);
+    setTargetMode('perPerson');
+    setProtein(String(prefill.protein));
+    setCalories(String(prefill.kcal));
+    setCarbs(String(prefill.carbs));
+    setFat(String(prefill.fat));
+    setDinnerFor(prefill);
+    setResult(null);
+    setError('');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [prefill && prefill.nonce]);
 
   function toggleDiet(d) {
     setDiets((list) => (list.includes(d) ? list.filter((x) => x !== d) : [...list, d]));
@@ -677,7 +1072,14 @@ function MealMode() {
         fancy,
         avoid: isRegen ? history : [],
       });
-      setResult({ ...data, targets, mealType, id: newId() });
+      setResult({
+        ...data,
+        targets,
+        mealType,
+        id: newId(),
+        logDate: dinnerFor ? dinnerFor.date : undefined,
+        logMeal: dinnerFor ? 'Dinner' : undefined,
+      });
       setHistory(isRegen ? [...history, data.name] : [data.name]);
     } catch (e) {
       setError(e.message);
@@ -689,6 +1091,23 @@ function MealMode() {
   return (
     <>
       <div ref={topRef} style={{ scrollMarginTop: 70 }} />
+
+      {dinnerFor && (
+        <section className="card" style={{ background: 'var(--accent-soft)' }}>
+          <div className="section-head">
+            <h2 className="card-title">
+              Filling {dinnerFor.dayName}'s dinner · {niceDate(dinnerFor.date)}
+            </h2>
+            <button type="button" className="link-btn" onClick={() => setDinnerFor(null)}>
+              Clear
+            </button>
+          </div>
+          <MacroPills m={dinnerFor} />
+          <p className="hint" style={{ marginBottom: 0 }}>
+            Your targets below are filled in from what's left of your day. Change anything you like.
+          </p>
+        </section>
+      )}
 
       <section className="card">
         <h2 className="card-title">
@@ -987,6 +1406,493 @@ function TargetsCard({ targets, actual, swap }) {
         </div>
       )}
     </section>
+  );
+}
+
+// ---------------------------------------------------------------
+// MODE 3: My week (uploaded meal plan)
+// ---------------------------------------------------------------
+function WeekMode({ plan, setPlan, log, removeLog, onBuildDinner }) {
+  const { notify, openCalendar } = useApp();
+  const [day, setDay] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  const fileRef = useRef(null);
+
+  async function onFile(e) {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = '';
+    if (!file) return;
+    setBusy(true);
+    setErr('');
+    try {
+      const XLSX = await loadXlsx();
+      const buf = await file.arrayBuffer();
+      const p = parsePlan(XLSX, buf, file.name);
+      setPlan(p);
+      setDay(null);
+      notify('Meal plan loaded');
+    } catch (ex) {
+      setErr(ex.message || "Couldn't read that file.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const uploadInput = (
+    <input
+      ref={fileRef}
+      type="file"
+      accept=".xlsx,.xls,.csv"
+      onChange={onFile}
+      style={{ display: 'none' }}
+      aria-label="Upload meal plan"
+    />
+  );
+
+  if (!plan) {
+    return (
+      <>
+        <section className="card">
+          <h2 className="card-title">
+            <span className="step-num">1</span>Load your meal plan
+          </h2>
+          <p style={{ margin: '0 0 14px', fontSize: 15, lineHeight: 1.5 }}>
+            Upload your weekly plan as a spreadsheet. You'll see each day's meals with their macros, and can send any meal
+            to your calendar in one tap.
+          </p>
+          {uploadInput}
+          <button
+            type="button"
+            className="btn btn-primary btn-block"
+            onClick={() => fileRef.current && fileRef.current.click()}
+            disabled={busy}
+          >
+            {busy ? 'Reading your plan…' : '⬆ Upload my meal plan'}
+          </button>
+          <a className="btn btn-block mt" href={TEMPLATE_URL} download style={{ textAlign: 'center', textDecoration: 'none' }}>
+            ⬇ Download blank template
+          </a>
+          <p className="hint">
+            New here? Download the template, fill in the yellow cells, then upload it. Your plan stays on this device only.
+          </p>
+        </section>
+        {err && <ErrorCard message={err} onRetry={() => fileRef.current && fileRef.current.click()} />}
+      </>
+    );
+  }
+
+  const names = plan.days.map((d) => d.name);
+  const todayName = WEEK[(new Date().getDay() + 6) % 7];
+  const current = day && names.includes(day) ? day : names.includes(todayName) ? todayName : names[0];
+  const dayPlan = plan.days.find((d) => d.name === current);
+  const date = dateForWeekday(current);
+  const entries = log[date] || [];
+  const logged = sumLog(entries);
+  const target = plan.target;
+
+  const mealKey = (i) => `${current}|${i}`;
+  const loggedFor = (i) => entries.filter((e) => e.planKey === mealKey(i));
+  const toAdd = dayPlan.meals.map((m, i) => ({ m, i })).filter(({ m, i }) => !m.choice && !loggedFor(i).length);
+
+  function itemFor(m, i) {
+    return { meal: m.meal, what: m.what, kcal: m.kcal, protein: m.protein, carbs: m.carbs, fat: m.fat, fibre: 0, planKey: mealKey(i) };
+  }
+
+  function addOne(m, i) {
+    openCalendar({ key: newId(), date, items: [itemFor(m, i)] });
+  }
+
+  function addWholeDay() {
+    if (!toAdd.length) return;
+    openCalendar({ key: newId(), date, items: toAdd.map(({ m, i }) => itemFor(m, i)) });
+  }
+
+  // What's left for a "your choice" dinner. Uses what you actually logged (e.g. 1½ portions),
+  // plus your planned meals you haven't logged yet, plus any extras you've logged.
+  function leftFor(m) {
+    const others = entries.filter((e) => String(e.meal).toLowerCase() !== 'dinner');
+    if (target && others.length) {
+      const counted = [];
+      dayPlan.meals.forEach((pm, i) => {
+        if (pm.choice) return;
+        const got = loggedFor(i);
+        if (got.length) counted.push(...got);
+        else counted.push(pm);
+      });
+      others.forEach((e) => {
+        if (!e.planKey || !e.planKey.startsWith(`${current}|`)) counted.push(e);
+      });
+      const t = sumLog(counted);
+      return {
+        from: "what you've logged and what's still planned",
+        kcal: Math.max(0, Math.round(target.kcal - t.kcal)),
+        protein: Math.max(0, r1(target.protein - t.protein)),
+        carbs: Math.max(0, r1(target.carbs - t.carbs)),
+        fat: Math.max(0, r1(target.fat - t.fat)),
+      };
+    }
+    return { from: 'your plan', kcal: m.kcal, protein: m.protein, carbs: m.carbs, fat: m.fat };
+  }
+
+  const bars = target
+    ? [
+        ['kcal', 'Calories', ' kcal'],
+        ['protein', 'Protein', 'g'],
+        ['carbs', 'Carbs', 'g'],
+        ['fat', 'Fat', 'g'],
+      ]
+    : [];
+
+  return (
+    <>
+      {uploadInput}
+
+      <section className="card">
+        <div className="section-head" style={{ marginBottom: 6 }}>
+          <h2 className="card-title" style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            📄 {plan.fileName}
+          </h2>
+          <button type="button" className="link-btn" onClick={() => fileRef.current && fileRef.current.click()} disabled={busy}>
+            {busy ? 'Reading…' : 'Replace'}
+          </button>
+        </div>
+        <p className="hint" style={{ margin: 0 }}>
+          {target
+            ? `Daily target: ${fmtK(target.kcal)} kcal · ${fmt(target.protein)}g protein · ${fmt(target.carbs)}g carbs · ${fmt(target.fat)}g fat`
+            : 'No daily target found in your plan. Add one to see your progress bars.'}
+        </p>
+        <p className="hint" style={{ marginBottom: 0 }}>
+          <a href={TEMPLATE_URL} download style={{ color: 'var(--accent)', fontWeight: 600 }}>
+            Download blank template
+          </a>{' '}
+          to share with someone else.
+        </p>
+      </section>
+
+      {err && <ErrorCard message={err} onRetry={() => fileRef.current && fileRef.current.click()} />}
+
+      <div className="chips" style={{ marginBottom: 14 }}>
+        {names.map((n) => (
+          <button key={n} type="button" className={`chip ${n === current ? 'active' : ''}`} onClick={() => setDay(n)}>
+            {n.slice(0, 3)}
+          </button>
+        ))}
+      </div>
+
+      <section className="card">
+        <div className="section-head">
+          <h2 className="card-title">
+            {current} · {niceDate(date)}
+          </h2>
+          {dayPlan.type && <span className="badge">{dayPlan.type}</span>}
+        </div>
+        <div className="hero-label" style={{ marginBottom: 4 }}>
+          Logged that day
+        </div>
+        <div style={{ fontSize: 30, fontWeight: 800, letterSpacing: '-0.02em', marginBottom: 10 }}>
+          {fmtK(logged.kcal)} <span className="muted" style={{ fontSize: 15, fontWeight: 600 }}>
+            {target ? `/ ${fmtK(target.kcal)} kcal` : 'kcal'}
+          </span>
+        </div>
+        {bars.map(([k, label, unit]) => {
+          const pct = target[k] ? (logged[k] / target[k]) * 100 : 0;
+          return (
+            <div className="target-row" key={k}>
+              <div className="target-head">
+                <span>
+                  {label}: <strong>{k === 'kcal' ? fmtK(logged[k]) : fmt(logged[k])}{unit}</strong>{' '}
+                  <span className="muted">of {k === 'kcal' ? fmtK(target[k]) : fmt(target[k])}{unit}</span>
+                </span>
+                <strong>{Math.round(pct)}%</strong>
+              </div>
+              <div className="bar">
+                <div className={`bar-fill ${pct > 110 ? 'over' : ''}`} style={{ width: `${Math.min(100, pct)}%` }} />
+              </div>
+            </div>
+          );
+        })}
+        {entries.length > 0 && (
+          <div className="mt">
+            {entries.map((e) => (
+              <div className="saved-item" key={e.id}>
+                <div className="saved-open" style={{ cursor: 'default' }}>
+                  <span className="saved-name">
+                    {e.time} · {e.meal}
+                    {e.portion !== 1 ? ` (${portionText(e.portion)}×)` : ''}
+                  </span>
+                  <span className="saved-meta">
+                    {fmtK(e.kcal)} kcal · P{fmt(e.protein)} C{fmt(e.carbs)} F{fmt(e.fat)}
+                  </span>
+                </div>
+                <button type="button" className="icon-btn" aria-label={`Remove ${e.meal}`} onClick={() => removeLog(date, e.id)}>
+                  ✕
+                </button>
+              </div>
+            ))}
+            <p className="hint" style={{ marginBottom: 0 }}>
+              Removing here updates your totals only. Delete the calendar entry in your calendar app.
+            </p>
+          </div>
+        )}
+      </section>
+
+      {dayPlan.meals.map((m, i) => {
+        const done = loggedFor(i);
+        const left = m.choice ? leftFor(m) : null;
+        return (
+          <section className="card" key={`${current}-${i}`}>
+            <div className="section-head" style={{ marginBottom: 6 }}>
+              <h3 className="card-title">{m.meal}</h3>
+            </div>
+            {m.what && (
+              <p style={{ margin: '0 0 10px', fontSize: 14, lineHeight: 1.5, color: 'var(--muted)' }}>{m.what}</p>
+            )}
+            {m.choice ? (
+              <>
+                <MacroPills m={left} />
+                <p className="hint">What's left, based on {left.from}.</p>
+                <button
+                  type="button"
+                  className="btn btn-secondary btn-block"
+                  onClick={() =>
+                    onBuildDinner({
+                      dayName: current,
+                      date,
+                      kcal: left.kcal,
+                      protein: left.protein,
+                      carbs: left.carbs,
+                      fat: left.fat,
+                    })
+                  }
+                >
+                  ✨ Build my dinner to fit
+                </button>
+              </>
+            ) : (
+              <>
+                <MacroPills m={m} />
+                <button
+                  type="button"
+                  className={`btn btn-block mt ${done.length ? 'is-done' : ''}`}
+                  onClick={() => addOne(m, i)}
+                >
+                  {done.length
+                    ? `✓ Added${done[0].portion !== 1 ? ` · ${portionText(done[0].portion)}×` : ''} · add again`
+                    : '📅 Add to calendar'}
+                </button>
+              </>
+            )}
+          </section>
+        );
+      })}
+
+      <button type="button" className="btn btn-primary btn-block" onClick={addWholeDay} disabled={!toAdd.length}>
+        {toAdd.length ? `📅 Add whole day (${toAdd.length} ${toAdd.length === 1 ? 'meal' : 'meals'})` : '✓ All planned meals added'}
+      </button>
+      <div style={{ textAlign: 'center' }} className="mt">
+        <button
+          type="button"
+          className="link-btn"
+          onClick={() => {
+            if (window.confirm('Remove this meal plan from this device?')) setPlan(null);
+          }}
+        >
+          Remove meal plan
+        </button>
+      </div>
+    </>
+  );
+}
+
+function MacroPills({ m }) {
+  const pill = (bg, color, text) => (
+    <span style={{ fontSize: 13, fontWeight: 700, padding: '5px 10px', borderRadius: 9, background: bg, color }}>{text}</span>
+  );
+  return (
+    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+      {pill('var(--ink)', '#fff', `${fmtK(m.kcal)} kcal`)}
+      {pill('var(--protein-soft)', 'var(--ink)', `P ${fmt(m.protein)}g`)}
+      {pill('var(--carbs-soft)', 'var(--ink)', `C ${fmt(m.carbs)}g`)}
+      {pill('var(--fat-soft)', 'var(--ink)', `F ${fmt(m.fat)}g`)}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------
+// Add to calendar pop-up
+// ---------------------------------------------------------------
+function CalendarSheet({ cfg, onClose }) {
+  const { times, addLogs, rememberTimes, notify } = useApp();
+  const single = cfg.items.length === 1;
+  const [date, setDate] = useState(cfg.date || todayIso());
+  const [portion, setPortion] = useState(1);
+  const [mealName, setMealName] = useState(cfg.items[0].meal);
+  const [timeList, setTimeList] = useState(() => cfg.items.map((it) => defaultTime(it.meal, times)));
+
+  const rows = cfg.items.map((it, i) => {
+    const por = single ? portion : 1;
+    const meal = single && cfg.pickMeal ? mealName : it.meal;
+    const m = scaled(it, por);
+    const time = timeList[i] || '12:00';
+    return {
+      it,
+      meal,
+      m,
+      por,
+      time,
+      ev: {
+        t: eventTitle(meal, m),
+        d: eventDetails(it.what, por, m),
+        s: toUtcStamp(date, time),
+        e: toUtcStamp(date, time, 15),
+      },
+    };
+  });
+
+  function setTimeAt(i, v) {
+    setTimeList((list) => list.map((t, j) => (j === i ? v : t)));
+  }
+
+  function finish(kind) {
+    // Open the calendar first, while the tap still counts (stops pop-up blockers)
+    if (kind === 'google') window.open(googleUrl(rows[0].ev), '_blank', 'noopener');
+    addLogs(
+      date,
+      rows.map((r) => ({
+        id: newId(),
+        meal: r.meal,
+        what: r.it.what,
+        planKey: r.it.planKey,
+        portion: r.por,
+        time: r.time,
+        kcal: r.m.kcal,
+        protein: r.m.protein,
+        carbs: r.m.carbs,
+        fat: r.m.fat,
+      }))
+    );
+    rememberTimes(rows.map((r) => [r.meal, r.time]));
+    notify(single ? `${rows[0].meal} logged` : `${rows.length} meals logged`);
+    onClose();
+    if (kind === 'ics') window.location.href = icsUrl(rows.map((r) => r.ev));
+  }
+
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-label="Add to calendar"
+      style={{ position: 'fixed', inset: 0, zIndex: 50, background: 'rgba(27,29,26,0.45)', display: 'flex', alignItems: 'flex-end', justifyContent: 'center' }}
+      onClick={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+    >
+      <div
+        style={{
+          background: 'var(--card)',
+          width: '100%',
+          maxWidth: 640,
+          maxHeight: '90vh',
+          overflowY: 'auto',
+          borderRadius: '22px 22px 0 0',
+          padding: '18px 18px calc(22px + env(safe-area-inset-bottom))',
+          boxSizing: 'border-box',
+        }}
+      >
+        <div className="section-head">
+          <h2 className="card-title">{single ? 'Add to calendar' : 'Add whole day'}</h2>
+          <button type="button" className="icon-btn" aria-label="Close" onClick={onClose}>
+            ✕
+          </button>
+        </div>
+
+        {single && cfg.pickMeal && (
+          <>
+            <label className="label">Which meal?</label>
+            <div className="chips">
+              {MEAL_TYPES.map((m) => (
+                <button key={m} type="button" className={`chip ${mealName === m ? 'active' : ''}`} onClick={() => setMealName(m)}>
+                  {m}
+                </button>
+              ))}
+            </div>
+          </>
+        )}
+
+        {single && (
+          <>
+            <label className="label">How much did you have?</label>
+            <div className="chips">
+              {PORTIONS.map((p) => (
+                <button key={p} type="button" className={`chip ${portion === p ? 'active' : ''}`} onClick={() => setPortion(p)}>
+                  {portionText(p)} {p <= 1 ? 'portion' : 'portions'}
+                </button>
+              ))}
+            </div>
+          </>
+        )}
+
+        <div className="field-grid" style={{ gridTemplateColumns: single ? '1fr 1fr' : '1fr' }}>
+          <div>
+            <label className="label" htmlFor="cal-date">
+              Date
+            </label>
+            <input id="cal-date" className="input" type="date" value={date} onChange={(e) => setDate(e.target.value || todayIso())} />
+          </div>
+          {single && (
+            <div>
+              <label className="label" htmlFor="cal-time">
+                Time
+              </label>
+              <input id="cal-time" className="input" type="time" value={timeList[0]} onChange={(e) => setTimeAt(0, e.target.value)} />
+            </div>
+          )}
+        </div>
+
+        <label className="label">{single ? 'Calendar entry' : 'Calendar entries'}</label>
+        {rows.map((r, i) => (
+          <div
+            key={i}
+            style={{ border: '1px solid var(--line)', borderLeft: '4px solid var(--accent)', borderRadius: 12, padding: '10px 12px', marginBottom: 8 }}
+          >
+            <div style={{ fontWeight: 700, fontSize: 14 }}>{r.ev.t}</div>
+            {single ? (
+              <div className="muted" style={{ fontSize: 13, marginTop: 4, whiteSpace: 'pre-line' }}>
+                {r.ev.d}
+              </div>
+            ) : (
+              <div className="row" style={{ marginTop: 6 }}>
+                <label className="muted" style={{ fontSize: 13 }} htmlFor={`cal-time-${i}`}>
+                  Time
+                </label>
+                <input
+                  id={`cal-time-${i}`}
+                  className="input input-small"
+                  type="time"
+                  value={timeList[i]}
+                  onChange={(e) => setTimeAt(i, e.target.value)}
+                />
+              </div>
+            )}
+          </div>
+        ))}
+
+        <button type="button" className="btn btn-primary btn-block mt" onClick={() => finish('ics')}>
+          📅 Apple / Outlook / phone calendar
+        </button>
+        {single && (
+          <button type="button" className="btn btn-secondary btn-block mt" onClick={() => finish('google')}>
+            Google Calendar
+          </button>
+        )}
+        <p className="hint" style={{ marginBottom: 0 }}>
+          {single
+            ? 'Your calendar opens with the entry filled in, so you can pick which calendar it goes in (e.g. a "Macros" calendar).'
+            : 'Your calendar opens with every meal filled in. Google Calendar users: add meals one at a time with the Google button instead.'}
+        </p>
+      </div>
+    </div>
   );
 }
 
