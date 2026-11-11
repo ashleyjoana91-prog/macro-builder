@@ -1010,7 +1010,7 @@ function MealMode({ prefill }) {
   // "Build my dinner" from My week fills in what's left for that day
   useEffect(() => {
     if (!prefill) return;
-    setMealType('Dinner');
+    setMealType(prefill.mealType || 'Dinner');
     setPeople(1);
     setTargetMode('perPerson');
     setProtein(String(prefill.protein));
@@ -1078,7 +1078,7 @@ function MealMode({ prefill }) {
         mealType,
         id: newId(),
         logDate: dinnerFor ? dinnerFor.date : undefined,
-        logMeal: dinnerFor ? 'Dinner' : undefined,
+        logMeal: dinnerFor ? mealType : undefined,
       });
       setHistory(isRegen ? [...history, data.name] : [data.name]);
     } catch (e) {
@@ -1096,7 +1096,7 @@ function MealMode({ prefill }) {
         <section className="card" style={{ background: 'var(--accent-soft)' }}>
           <div className="section-head">
             <h2 className="card-title">
-              Filling {dinnerFor.dayName}'s dinner · {niceDate(dinnerFor.date)}
+              Filling {dinnerFor.dayName}'s {String(dinnerFor.mealType || 'Dinner').toLowerCase()} · {niceDate(dinnerFor.date)}
             </h2>
             <button type="button" className="link-btn" onClick={() => setDinnerFor(null)}>
               Clear
@@ -1482,10 +1482,12 @@ function WeekMode({ plan, setPlan, log, removeLog, onBuildDinner }) {
     );
   }
 
-  const names = plan.days.map((d) => d.name);
+  // All seven days are always shown, even if the plan only covers some of them
+  const names = WEEK;
   const todayName = WEEK[(new Date().getDay() + 6) % 7];
-  const current = day && names.includes(day) ? day : names.includes(todayName) ? todayName : names[0];
-  const dayPlan = plan.days.find((d) => d.name === current);
+  const current = day || todayName;
+  const dayPlan = plan.days.find((d) => d.name === current) || { name: current, type: '', meals: [] };
+  const hasPlanned = dayPlan.meals.some((m) => !m.choice);
   const date = dateForWeekday(current);
   const entries = log[date] || [];
   const logged = sumLog(entries);
@@ -1534,6 +1536,15 @@ function WeekMode({ plan, setPlan, log, removeLog, onBuildDinner }) {
     }
     return { from: 'your plan', kcal: m.kcal, protein: m.protein, carbs: m.carbs, fat: m.fat };
   }
+
+  const leftAfterLogged = target
+    ? {
+        kcal: Math.max(0, Math.round(target.kcal - logged.kcal)),
+        protein: Math.max(0, r1(target.protein - logged.protein)),
+        carbs: Math.max(0, r1(target.carbs - logged.carbs)),
+        fat: Math.max(0, r1(target.fat - logged.fat)),
+      }
+    : null;
 
   const bars = target
     ? [
@@ -1659,6 +1670,7 @@ function WeekMode({ plan, setPlan, log, removeLog, onBuildDinner }) {
                     onBuildDinner({
                       dayName: current,
                       date,
+                      mealType: 'Dinner',
                       kcal: left.kcal,
                       protein: left.protein,
                       carbs: left.carbs,
@@ -1687,9 +1699,39 @@ function WeekMode({ plan, setPlan, log, removeLog, onBuildDinner }) {
         );
       })}
 
-      <button type="button" className="btn btn-primary btn-block" onClick={addWholeDay} disabled={!toAdd.length}>
-        {toAdd.length ? `📅 Add whole day (${toAdd.length} ${toAdd.length === 1 ? 'meal' : 'meals'})` : '✓ All planned meals added'}
-      </button>
+      {!dayPlan.meals.length && (
+        <section className="card">
+          <h3 className="card-title">Nothing planned for {current}</h3>
+          {target ? (
+            <>
+              <MacroPills m={leftAfterLogged} />
+              <p className="hint">What's left of your daily target, after anything you've logged.</p>
+              <button
+                type="button"
+                className="btn btn-secondary btn-block"
+                onClick={() =>
+                  onBuildDinner({ dayName: current, date, mealType: guessMeal(), ...leftAfterLogged })
+                }
+              >
+                ✨ Build a meal to fit
+              </button>
+            </>
+          ) : (
+            <p className="hint" style={{ margin: 0 }}>Log what you eat below and it adds up here.</p>
+          )}
+        </section>
+      )}
+
+      <ExtraLog date={date} dayName={current} />
+
+      {hasPlanned && (
+        <button type="button" className="btn btn-primary btn-block" onClick={addWholeDay} disabled={!toAdd.length}>
+          {toAdd.length ? `📅 Add whole day (${toAdd.length} ${toAdd.length === 1 ? 'meal' : 'meals'})` : '✓ All planned meals added'}
+        </button>
+      )}
+
+      <WeekExport plan={plan} log={log} />
+
       <div style={{ textAlign: 'center' }} className="mt">
         <button
           type="button"
@@ -1702,6 +1744,189 @@ function WeekMode({ plan, setPlan, log, removeLog, onBuildDinner }) {
         </button>
       </div>
     </>
+  );
+}
+
+// Log something that isn't on the plan (weekends, a coffee, a meal out)
+function ExtraLog({ date, dayName }) {
+  const { openCalendar, notify } = useApp();
+  const [open, setOpen] = useState(false);
+  const [what, setWhat] = useState('');
+  const [vals, setVals] = useState({ kcal: '', protein: '', carbs: '', fat: '' });
+
+  const setVal = (k, v) => setVals((x) => ({ ...x, [k]: cleanNum(v) }));
+
+  function go() {
+    const n = (k) => parseFloat(vals[k]) || 0;
+    const protein = n('protein');
+    const carbs = n('carbs');
+    const fat = n('fat');
+    // If calories are left blank, work them out from the macros (4 / 4 / 9)
+    const kcal = n('kcal') || Math.round(protein * 4 + carbs * 4 + fat * 9);
+    if (!kcal && !protein && !carbs && !fat) {
+      notify('Add the calories or macros first');
+      return;
+    }
+    openCalendar({
+      key: newId(),
+      date,
+      pickMeal: true,
+      items: [{ meal: guessMeal(), what: what.trim(), kcal, protein, carbs, fat, fibre: 0 }],
+    });
+    setWhat('');
+    setVals({ kcal: '', protein: '', carbs: '', fat: '' });
+    setOpen(false);
+  }
+
+  if (!open) {
+    return (
+      <button type="button" className="btn btn-block" style={{ marginBottom: 14 }} onClick={() => setOpen(true)}>
+        ➕ Log something not on the plan
+      </button>
+    );
+  }
+
+  return (
+    <section className="card">
+      <div className="section-head">
+        <h3 className="card-title">Log something else · {dayName}</h3>
+        <button type="button" className="link-btn" onClick={() => setOpen(false)}>
+          Cancel
+        </button>
+      </div>
+      <label className="label" htmlFor="extra-what">
+        What did you have?
+      </label>
+      <input
+        id="extra-what"
+        className="input"
+        value={what}
+        onChange={(e) => setWhat(e.target.value)}
+        placeholder="e.g. Flat white and a banana"
+      />
+      <div className="field-grid" style={{ gridTemplateColumns: 'repeat(2, 1fr)' }}>
+        {[
+          ['kcal', 'Calories'],
+          ['protein', 'Protein (g)'],
+          ['carbs', 'Carbs (g)'],
+          ['fat', 'Fat (g)'],
+        ].map(([k, label]) => (
+          <div key={k}>
+            <label className="label" htmlFor={`extra-${k}`}>
+              {label}
+            </label>
+            <input
+              id={`extra-${k}`}
+              className="input"
+              inputMode="decimal"
+              value={vals[k]}
+              onChange={(e) => setVal(k, e.target.value)}
+              placeholder={k === 'kcal' ? 'kcal' : 'g'}
+            />
+          </div>
+        ))}
+      </div>
+      <button type="button" className="btn btn-primary btn-block mt" onClick={go}>
+        📅 Add to calendar
+      </button>
+      <p className="hint" style={{ marginBottom: 0 }}>
+        Leave calories blank and they're worked out from the macros. Don't know the macros? Use My macros, then "Add a
+        portion to my calendar".
+      </p>
+    </section>
+  );
+}
+
+// ---------------------------------------------------------------
+// Export a week of logged meals
+// ---------------------------------------------------------------
+function weekDays(offsetWeeks) {
+  const now = new Date();
+  const dow = (now.getDay() + 6) % 7;
+  return WEEK.map((name, i) => ({
+    name,
+    date: isoDate(new Date(now.getFullYear(), now.getMonth(), now.getDate() - dow + i + offsetWeeks * 7)),
+  }));
+}
+
+function WeekExport({ plan, log }) {
+  const { notify, printIt } = useApp();
+  const [offset, setOffset] = useState(0);
+  const days = weekDays(offset);
+  const target = plan && plan.target;
+  const range = `${niceDate(days[0].date)} – ${niceDate(days[6].date)}`;
+
+  const perDay = days.map((d) => {
+    const entries = (log[d.date] || []).slice().sort((a, b) => String(a.time).localeCompare(String(b.time)));
+    return { ...d, entries, t: sumLog(entries) };
+  });
+  const logged = perDay.filter((d) => d.entries.length);
+  const week = sumLog(logged.map((d) => d.t));
+  const avg = (k) => (logged.length ? week[k] / logged.length : 0);
+
+  // Uses the same print-to-PDF as recipes: choose "Save as PDF" in the print screen
+  function downloadPdf() {
+    if (!logged.length) return;
+    printIt({ mode: 'week', range, perDay, week, logged: logged.length, avg: { kcal: avg('kcal'), protein: avg('protein'), carbs: avg('carbs'), fat: avg('fat') }, target });
+  }
+
+  function weekText() {
+    const lines = [`My macros · week of ${range}`, ''];
+    perDay.forEach((d) => {
+      if (!d.entries.length) return;
+      lines.push(`${d.name} ${niceDate(d.date)}: ${fmtK(d.t.kcal)} kcal · P${fmt(d.t.protein)} C${fmt(d.t.carbs)} F${fmt(d.t.fat)}`);
+      d.entries.forEach((e) =>
+        lines.push(`  ${e.time} ${e.meal}${e.portion !== 1 ? ` (${portionText(e.portion)}×)` : ''}: ${fmtK(e.kcal)} kcal · P${fmt(e.protein)}`)
+      );
+    });
+    lines.push('');
+    lines.push(`Daily average (${logged.length} days): ${fmtK(avg('kcal'))} kcal · P${fmt(avg('protein'))} C${fmt(avg('carbs'))} F${fmt(avg('fat'))}`);
+    if (target) lines.push(`Daily target: ${fmtK(target.kcal)} kcal · P${fmt(target.protein)} C${fmt(target.carbs)} F${fmt(target.fat)}`);
+    lines.push('', 'Made with Macro Builder');
+    return lines.join('\n');
+  }
+
+  async function shareText() {
+    if (!logged.length) return;
+    const text = weekText();
+    if (navigator.share) {
+      try {
+        await navigator.share({ title: `Macros week of ${range}`, text });
+        return;
+      } catch (e) {
+        if (e && e.name === 'AbortError') return;
+      }
+    }
+    const ok = await copyText(text);
+    notify(ok ? 'Copied – paste it anywhere' : "Couldn't copy on this device");
+  }
+
+  return (
+    <section className="card mt">
+      <h3 className="card-title">Export a week</h3>
+      <div className="chips">
+        <button type="button" className={`chip ${offset === 0 ? 'active' : ''}`} onClick={() => setOffset(0)}>
+          This week
+        </button>
+        <button type="button" className={`chip ${offset === -1 ? 'active' : ''}`} onClick={() => setOffset(-1)}>
+          Last week
+        </button>
+      </div>
+      <p className="hint">
+        {range} ·{' '}
+        {logged.length
+          ? `${logged.length} ${logged.length === 1 ? 'day' : 'days'} logged · average ${fmtK(avg('kcal'))} kcal, ${fmt(avg('protein'))}g protein a day`
+          : 'nothing logged yet'}
+      </p>
+      <div className="action-grid">
+        <button type="button" className="btn" onClick={downloadPdf} disabled={!logged.length}>
+          ⬇ Download PDF
+        </button>
+        <button type="button" className="btn" onClick={shareText} disabled={!logged.length}>
+          ↗ Share as text
+        </button>
+      </div>
+    </section>
   );
 }
 
@@ -2047,6 +2272,7 @@ function ErrorCard({ message, onRetry }) {
 // ---------------------------------------------------------------
 function PrintView({ item }) {
   if (!item) return <div className="print-area" />;
+  if (item.mode === 'week') return <WeekPrint item={item} />;
   const isMeal = item.mode === 'meal';
   const per = item.perServing;
   const time = timeText(item);
@@ -2120,6 +2346,127 @@ function PrintView({ item }) {
       <p className="print-footer">
         Made with Macro Builder · {fmtDate(new Date().toISOString())}. Nutrition values are estimates based on UK
         data and raw weights.
+      </p>
+    </div>
+  );
+}
+
+function WeekPrint({ item }) {
+  const { perDay, week, avg, target, range } = item;
+  const vs = (got, want) => {
+    const d = Math.round(got - want);
+    return d === 0 ? 'on target' : d > 0 ? `+${fmtK(d)}` : `−${fmtK(-d)}`;
+  };
+  return (
+    <div className="print-area">
+      <h1>My week of macros</h1>
+      <p className="print-meta">
+        {range} · {item.logged} {item.logged === 1 ? 'day' : 'days'} logged
+      </p>
+
+      <div className="print-macros">
+        <div>
+          <span>Daily average:</span> {fmtK(avg.kcal)} kcal
+        </div>
+        <div>{fmt(avg.protein)}g protein</div>
+        <div>{fmt(avg.carbs)}g carbs</div>
+        <div>{fmt(avg.fat)}g fat</div>
+      </div>
+      {target && (
+        <p className="print-desc">
+          Daily target: {fmtK(target.kcal)} kcal · {fmt(target.protein)}g protein · {fmt(target.carbs)}g carbs ·{' '}
+          {fmt(target.fat)}g fat
+        </p>
+      )}
+
+      <h2>Day by day</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Day</th>
+            <th>kcal</th>
+            <th>Protein</th>
+            <th>Carbs</th>
+            <th>Fat</th>
+            {target && <th>kcal vs target</th>}
+            {target && <th>Protein vs target</th>}
+          </tr>
+        </thead>
+        <tbody>
+          {perDay.map((d) => (
+            <tr key={d.date}>
+              <td>
+                {d.name} {niceDate(d.date).replace(/^\w+ /, '')}
+              </td>
+              {d.entries.length ? (
+                <>
+                  <td>{fmtK(d.t.kcal)}</td>
+                  <td>{fmt(d.t.protein)}g</td>
+                  <td>{fmt(d.t.carbs)}g</td>
+                  <td>{fmt(d.t.fat)}g</td>
+                  {target && <td>{vs(d.t.kcal, target.kcal)}</td>}
+                  {target && <td>{vs(d.t.protein, target.protein)}g</td>}
+                </>
+              ) : (
+                <td colSpan={target ? 6 : 4}>Nothing logged</td>
+              )}
+            </tr>
+          ))}
+          <tr className="total-row">
+            <td>Week total</td>
+            <td>{fmtK(week.kcal)}</td>
+            <td>{fmt(week.protein)}g</td>
+            <td>{fmt(week.carbs)}g</td>
+            <td>{fmt(week.fat)}g</td>
+            {target && <td></td>}
+            {target && <td></td>}
+          </tr>
+        </tbody>
+      </table>
+
+      <h2>Meals logged</h2>
+      {perDay
+        .filter((d) => d.entries.length)
+        .map((d) => (
+          <div key={d.date} style={{ breakInside: 'avoid' }}>
+            <h3 style={{ margin: '14px 0 6px', fontSize: 14 }}>
+              {d.name} {niceDate(d.date).replace(/^\w+ /, '')} · {fmtK(d.t.kcal)} kcal · {fmt(d.t.protein)}g protein
+            </h3>
+            <table>
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Meal</th>
+                  <th>What</th>
+                  <th>kcal</th>
+                  <th>P</th>
+                  <th>C</th>
+                  <th>F</th>
+                </tr>
+              </thead>
+              <tbody>
+                {d.entries.map((e) => (
+                  <tr key={e.id}>
+                    <td>{e.time}</td>
+                    <td>
+                      {e.meal}
+                      {e.portion !== 1 ? ` (${portionText(e.portion)}×)` : ''}
+                    </td>
+                    <td>{e.what || ''}</td>
+                    <td>{fmtK(e.kcal)}</td>
+                    <td>{fmt(e.protein)}</td>
+                    <td>{fmt(e.carbs)}</td>
+                    <td>{fmt(e.fat)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ))}
+
+      <p className="print-footer">
+        Made with Macro Builder · {fmtDate(new Date().toISOString())}. Figures are as logged in the app; plan values come
+        from your meal plan.
       </p>
     </div>
   );
